@@ -1,7 +1,7 @@
 import React, { useState, useRef } from 'react';
 import { Project, ProjectSettings } from '../types';
 import { ChevronLeft, ArrowLeft, RotateCw, Check, Upload, Smartphone, Server, Image as ImageIcon, Sparkles, Layers, ShieldCheck, Download, Code, HelpCircle, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react';
-import { generateAndroidProjectBundle, triggerFileDownload } from '../utils/apkBuilder';
+import { generateAndroidProjectBundle, triggerFileDownload, installOrDownloadApk } from '../utils/apkBuilder';
 import { buildRealAndroidApk } from '../utils/realApkEngine';
 
 interface ApkConverterScreenProps {
@@ -174,7 +174,12 @@ export const ApkConverterScreen: React.FC<ApkConverterScreenProps> = ({
         generateAndroidProjectBundle(projectWithSettings),
         buildRealAndroidApk(projectWithSettings)
       ]);
-      setBuiltApkBlob(realApkBlob || bundle.apkBlob);
+
+      if (!realApkBlob || realApkBlob.size < 8192) {
+        throw new Error('Failed to generate valid signed APK package.');
+      }
+
+      setBuiltApkBlob(realApkBlob);
       setBuiltProjectBlob(bundle.projectZipBlob);
       setManifestXml(bundle.manifestXml);
 
@@ -184,19 +189,18 @@ export const ApkConverterScreen: React.FC<ApkConverterScreenProps> = ({
       setIsBuilding(false);
       setBuildSuccess(true);
 
-      // Auto trigger direct in-app download for convenience
-      if (realApkBlob || bundle.apkBlob) {
-        setTimeout(() => {
-          triggerFileDownload(
-            realApkBlob || bundle.apkBlob,
-            `${(settings.appName || 'app').replace(/[^a-zA-Z0-9_-]/g, '_')}.apk`,
-            'application/vnd.android.package-archive'
-          );
-        }, 300);
-      }
-    } catch (err) {
-      console.error(err);
+      // Auto trigger direct install/download flow
+      setTimeout(() => {
+        installOrDownloadApk(
+          realApkBlob,
+          `${(settings.appName || 'app').replace(/[^a-zA-Z0-9_-]/g, '_')}.apk`
+        );
+      }, 300);
+    } catch (err: any) {
+      console.error('[APK Build Error]', err);
       setIsBuilding(false);
+      setBuildSuccess(false);
+      alert('APK Generation Error: ' + (err?.message || 'Failed to compile valid Android APK package.'));
     }
   };
 
@@ -656,10 +660,9 @@ export const ApkConverterScreen: React.FC<ApkConverterScreenProps> = ({
                 id="btn-download-binary-apk"
                 onClick={() => {
                   if (builtApkBlob) {
-                    triggerFileDownload(
+                    installOrDownloadApk(
                       builtApkBlob, 
-                      `${(settings.appName || 'app').replace(/[^a-zA-Z0-9_-]/g, '_')}.apk`, 
-                      'application/vnd.android.package-archive'
+                      `${(settings.appName || 'app').replace(/[^a-zA-Z0-9_-]/g, '_')}.apk`
                     );
                   }
                 }}

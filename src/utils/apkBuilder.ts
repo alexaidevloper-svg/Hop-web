@@ -354,3 +354,96 @@ export function triggerFileDownload(blob: Blob, filename: string, mimeType?: str
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
+
+/**
+ * Installs APK using native Android bridge if available, or falls back to direct browser download
+ */
+export async function installOrDownloadApk(blob: Blob, filename: string): Promise<void> {
+  const safeFilename = filename.endsWith('.apk') ? filename : `${filename}.apk`;
+  const mimeType = 'application/vnd.android.package-archive';
+
+  // Check if running inside native Android WebView container with a native Android bridge
+  const win = window as any;
+  const bridge = win.AndroidBridge || win.Android || win.android || win.HopWebBridge || win.HopWeb || win.AndroidInstaller || win.NativeBridge || win.JSBridge;
+
+  if (bridge) {
+    try {
+      const reader = new FileReader();
+      const base64Promise = new Promise<string>((resolve, reject) => {
+        reader.onloadend = () => {
+          const res = reader.result as string;
+          const base64 = res.includes(',') ? res.split(',')[1] : res;
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      const base64Data = await base64Promise;
+
+      if (typeof bridge.installApk === 'function') {
+        bridge.installApk(base64Data, safeFilename, mimeType);
+        return;
+      }
+      if (typeof bridge.installPackage === 'function') {
+        bridge.installPackage(base64Data, safeFilename);
+        return;
+      }
+      if (typeof bridge.installApkFile === 'function') {
+        bridge.installApkFile(base64Data, safeFilename);
+        return;
+      }
+      if (typeof bridge.launchPackageInstaller === 'function') {
+        bridge.launchPackageInstaller(base64Data, safeFilename);
+        return;
+      }
+      if (typeof bridge.openApk === 'function') {
+        bridge.openApk(base64Data, safeFilename);
+        return;
+      }
+      if (typeof bridge.postMessage === 'function') {
+        bridge.postMessage(JSON.stringify({
+          action: 'INSTALL_APK',
+          base64: base64Data,
+          filename: safeFilename,
+          mimeType
+        }));
+        return;
+      }
+    } catch (bridgeErr) {
+      console.warn('[Install] Native bridge call error, falling back to download:', bridgeErr);
+    }
+  }
+
+  // Webkit message handler support for native WebViews
+  if (win.webkit && win.webkit.messageHandlers) {
+    try {
+      const handler = win.webkit.messageHandlers.android || win.webkit.messageHandlers.AndroidBridge || win.webkit.messageHandlers.installApk;
+      if (handler && typeof handler.postMessage === 'function') {
+        const reader = new FileReader();
+        const base64Promise = new Promise<string>((resolve, reject) => {
+          reader.onloadend = () => {
+            const res = reader.result as string;
+            const base64 = res.includes(',') ? res.split(',')[1] : res;
+            resolve(base64);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        const base64Data = await base64Promise;
+        handler.postMessage({
+          action: 'INSTALL_APK',
+          base64: base64Data,
+          filename: safeFilename,
+          mimeType
+        });
+        return;
+      }
+    } catch (e) {
+      console.warn('[Install] Webkit bridge call error:', e);
+    }
+  }
+
+  // Browser Fallback (e.g. standard Chrome): Download .apk directly
+  triggerFileDownload(blob, safeFilename, mimeType);
+}

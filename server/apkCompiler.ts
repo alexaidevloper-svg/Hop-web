@@ -170,8 +170,19 @@ export async function compileRealApk(options: ApkCompileOptions): Promise<Buffer
   const allowCamera = Boolean(options.allowCamera);
   const allowMic = Boolean(options.allowMic);
 
-  const keystorePath = path.resolve(process.cwd(), 'keystore/debug.keystore');
+  const keystoreDir = path.resolve(process.cwd(), 'keystore');
+  const keystorePath = path.join(keystoreDir, 'debug.keystore');
   const androidJar = '/usr/lib/android-sdk/platforms/android-23/android.jar';
+
+  // Ensure keystore exists
+  if (!fs.existsSync(keystorePath)) {
+    try {
+      fs.mkdirSync(keystoreDir, { recursive: true });
+      await execAsync(`keytool -genkey -v -keystore "${keystorePath}" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"`);
+    } catch (e) {
+      console.warn('[APK Builder] Keystore generation warning:', e);
+    }
+  }
 
   // Check if native Android SDK tools exist
   let hasNativeSdk = false;
@@ -502,6 +513,29 @@ public class MainActivity extends Activity {
     const finalApk = path.join(buildDir, 'release.apk');
     await execAsync(`apksigner sign --ks "${keystorePath}" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "${finalApk}" "${alignedApk}"`);
 
+    // 12. Strict APK Validation
+    if (!fs.existsSync(finalApk)) {
+      throw new Error('APK output file was not generated');
+    }
+
+    const apkStats = fs.statSync(finalApk);
+    if (apkStats.size < 8192) {
+      throw new Error(`Generated APK file size is too small (${apkStats.size} bytes)`);
+    }
+
+    // Verify package structure and badging
+    const badgingOutput = await execAsync(`aapt dump badging "${finalApk}"`);
+    if (!badgingOutput.stdout.includes(`package: name='${pkg}'`)) {
+      console.warn(`[APK Builder] Warning: badging package mismatch, output: ${badgingOutput.stdout.slice(0, 150)}`);
+    }
+
+    // Verify signature schemes
+    const verifyOutput = await execAsync(`apksigner verify --verbose "${finalApk}"`);
+    if (!verifyOutput.stdout.includes('Verifies')) {
+      throw new Error('APK signature verification failed: ' + verifyOutput.stdout);
+    }
+
+    console.log(`[APK Builder] APK verified successfully. Size: ${apkStats.size} bytes, Package: ${pkg}`);
     const apkBuffer = fs.readFileSync(finalApk);
     return apkBuffer;
   } catch (err) {

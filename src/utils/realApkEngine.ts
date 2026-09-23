@@ -120,6 +120,54 @@ export function getStandardResourcesArsc(packageName: string, appName: string): 
 }
 
 /**
+ * Verifies that a Blob is a genuine, valid Android APK archive
+ */
+export async function verifyApkBlob(blob: Blob, expectedPackageName?: string): Promise<{ valid: boolean; error?: string }> {
+  if (!blob || blob.size < 8192) {
+    return { valid: false, error: `Invalid APK file size (${blob?.size || 0} bytes). Expected at least 8KB.` };
+  }
+
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+
+    // Verify ZIP magic header: 0x50 0x4B 0x03 0x04 ("PK\x03\x04")
+    if (bytes[0] !== 0x50 || bytes[1] !== 0x4b || bytes[2] !== 0x03 || bytes[3] !== 0x04) {
+      return { valid: false, error: 'File is not a valid APK/ZIP archive format.' };
+    }
+
+    const zip = await JSZip.loadAsync(arrayBuffer);
+
+    // Verify required Android binary entries
+    const manifest = zip.file('AndroidManifest.xml');
+    if (!manifest) {
+      return { valid: false, error: 'Corrupted APK: AndroidManifest.xml missing.' };
+    }
+
+    const dex = zip.file('classes.dex');
+    if (!dex) {
+      return { valid: false, error: 'Corrupted APK: classes.dex bytecode missing.' };
+    }
+
+    const resTable = zip.file('resources.arsc');
+    if (!resTable) {
+      return { valid: false, error: 'Corrupted APK: resources.arsc table missing.' };
+    }
+
+    // Check signature files
+    const metaInf = zip.folder('META-INF');
+    const hasSignature = metaInf && Object.keys(metaInf.files).length > 0;
+    if (!hasSignature) {
+      console.warn('[RealApkEngine] Warning: META-INF signature folder not detected in zip root.');
+    }
+
+    return { valid: true };
+  } catch (err: any) {
+    return { valid: false, error: err?.message || 'Failed to inspect APK archive structure.' };
+  }
+}
+
+/**
  * Builds a 100% Real Android APK file (.apk) packed with assets, binary manifest, DEX bytecode and resources
  */
 export async function buildRealAndroidApk(project: Project): Promise<Blob> {
@@ -128,7 +176,7 @@ export async function buildRealAndroidApk(project: Project): Promise<Blob> {
   const versionCode = parseInt(project.settings.versionCode || '1', 10) || 1;
   const versionName = project.settings.versionName || '1.0.0';
 
-  // 1. First attempt: Official Server-side Android SDK Toolchain (AAPT + javac + dx + zipalign + apksigner)
+  // 1. Primary: Official Server-side Android SDK Toolchain (AAPT + javac + dx + zipalign + apksigner)
   try {
     const payload = {
       appName,
@@ -158,68 +206,21 @@ export async function buildRealAndroidApk(project: Project): Promise<Blob> {
 
     if (res.ok) {
       const blob = await res.blob();
-      if (blob && blob.size > 2000) {
-        console.log(`[RealApkEngine] Native Android SDK compiled genuine APK successfully (${blob.size} bytes)`);
+      const validation = await verifyApkBlob(blob, pkgName);
+      if (validation.valid) {
+        console.log(`[RealApkEngine] Native Android SDK genuine APK verified successfully (${blob.size} bytes)`);
         return blob;
+      } else {
+        console.error('[RealApkEngine] Server APK validation error:', validation.error);
+        throw new Error(validation.error);
       }
     } else {
       const errText = await res.text();
       console.warn('[RealApkEngine] Server build returned non-OK status:', res.status, errText);
+      throw new Error(`Server build failed with status ${res.status}: ${errText}`);
     }
   } catch (err) {
-    console.warn('[RealApkEngine] Server build request failed, falling back to local bundle:', err);
+    console.error('[RealApkEngine] APK compilation failed:', err);
+    throw err;
   }
-
-  // 2. Fallback
-  const apkZip = new JSZip();
-
-  // 1. AndroidManifest.xml compiled binary XML
-  const binaryManifest = compileBinaryManifest(pkgName, versionCode, versionName, appName, {
-    minSdk: 21,
-    targetSdk: 34,
-    orientation: project.settings.screenRotation || 'unspecified',
-    allowCamera: project.settings.allowUsingCamera,
-    allowMic: project.settings.allowUsingMicrophone,
-    fullscreen: project.settings.fullscreenMode,
-  });
-  apkZip.file('AndroidManifest.xml', binaryManifest);
-
-  // 2. Dalvik Executable Bytecode (classes.dex)
-  const dexBytes = getStandardDalvikDex();
-  apkZip.file('classes.dex', dexBytes);
-
-  // 3. Compiled Android Resources (resources.arsc)
-  const resArscBytes = getStandardResourcesArsc(pkgName, appName);
-  apkZip.file('resources.arsc', resArscBytes);
-
-  // 4. Web Assets in assets/web/
-  for (const file of project.files) {
-    if (file.extension === 'png' && file.content.startsWith('data:image')) {
-      const base64Data = file.content.split(',')[1];
-      apkZip.file(`assets/web/${file.name}`, base64Data, { base64: true });
-    } else {
-      apkZip.file(`assets/web/${file.name}`, file.content);
-    }
-  }
-
-  // 5. App Icon in res/mipmap-hdpi/ic_launcher.png
-  if (project.settings.appIcon && project.settings.appIcon.startsWith('data:image')) {
-    const iconBase64 = project.settings.appIcon.split(',')[1];
-    apkZip.file('res/mipmap-hdpi/ic_launcher.png', iconBase64, { base64: true });
-    apkZip.file('res/mipmap-mdpi/ic_launcher.png', iconBase64, { base64: true });
-    apkZip.file('res/mipmap-xhdpi/ic_launcher.png', iconBase64, { base64: true });
-    apkZip.file('res/mipmap-xxhdpi/ic_launcher.png', iconBase64, { base64: true });
-  }
-
-  // 6. Security Signature (META-INF)
-  apkZip.file('META-INF/MANIFEST.MF', `Manifest-Version: 1.0\nCreated-By: 1.8.0_292 (HopWeb Android Build Engine)\nBuilt-By: HopWeb Studio\nPackage-Name: ${pkgName}\n\nName: AndroidManifest.xml\nSHA1-Digest: 2jmj7l5rSw0yVb/vlWAYkK/YBwk=\n\nName: classes.dex\nSHA1-Digest: nT2q9gLzXj6e6qXF4N1M2Wb4/X8=\n\nName: resources.arsc\nSHA1-Digest: K3V0n7R8W4X9Y2m5Z1A6B3C7D9E=\n`);
-  apkZip.file('META-INF/CERT.SF', `Signature-Version: 1.0\nCreated-By: 1.0 (Android SignApk)\nSHA1-Digest-Manifest: 3kLk4yQvW1p9mX0L5Z8R6A2B7C1=\n\nName: AndroidManifest.xml\nSHA1-Digest: 2jmj7l5rSw0yVb/vlWAYkK/YBwk=\n\nName: classes.dex\nSHA1-Digest: nT2q9gLzXj6e6qXF4N1M2Wb4/X8=\n\nName: resources.arsc\nSHA1-Digest: K3V0n7R8W4X9Y2m5Z1A6B3C7D9E=\n`);
-
-  // Generate standard .apk blob
-  return await apkZip.generateAsync({
-    type: 'blob',
-    mimeType: 'application/vnd.android.package-archive',
-    compression: 'DEFLATE',
-    compressionOptions: { level: 6 }
-  });
 }
